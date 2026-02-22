@@ -8,6 +8,7 @@ export default defineNuxtConfig({
 
   // Configuración de SEO y fuentes globales
   app: {
+    pageTransition: { name: 'page', mode: 'out-in' },
     head: {
       htmlAttrs: { lang: 'es' },
       meta: [
