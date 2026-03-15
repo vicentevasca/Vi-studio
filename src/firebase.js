@@ -20,6 +20,12 @@ const firebaseConfig = {
 
 // Initialize Firebase
 const app = initializeApp(firebaseConfig);
-const analytics = getAnalytics(app);
+
+// Analytics solo en el cliente — getAnalytics requiere APIs del navegador
+// y lanza un error si se ejecuta en contexto SSR/SSG (Node.js)
+if (typeof window !== 'undefined') {
+  getAnalytics(app);
+}
+
 export const db = getFirestore(app);
 export const auth = getAuth(app);

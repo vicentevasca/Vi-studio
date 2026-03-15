@@ -1,296 +1,530 @@
 <script setup>
-import { ref, onMounted, onUnmounted, watch, computed } from 'vue'
-import { doc, onSnapshot, updateDoc, collection, query, where, getDocs, writeBatch } from 'firebase/firestore'
+import { ref, computed, watch } from 'vue'
+import { doc, updateDoc, addDoc, collection, serverTimestamp } from 'firebase/firestore'
 import { db } from '../../../firebase'
+import { leads, tasks, updateLeadData } from '../../../store/admin'
+import { financeAutomation } from '../../../services/financeAutomation'
+import { handlePipelineTransition } from '../../../services/pipelineAutomation'
+import { useToast } from '../../../composables/useToast'
+import { useNotes } from '../../../composables/useNotes'
 
 const props = defineProps({ leadId: { type: String, required: true } })
 const emit = defineEmits(['close'])
 
-// --- ESTADOS DE DATOS ---
-const lead = ref(null)      
-const localLead = ref(null) 
-const localTasks = ref([]) // Tareas en memoria
-const newDraftTask = ref({ title: '', priority: 'medium' })
+const toast = useToast()
+const { notes, addNote } = useNotes(props.leadId)
 
-const loading = ref(true)
+const lead = computed(() => leads.value.find(l => l.id === props.leadId))
+const localLead = ref(null)
 const isSaving = ref(false)
-const hasChanges = ref(false)
-let unsub = null
-
 const activeTab = ref('resumen')
 
-const tabs = [
-  { id: 'resumen', label: 'Dashboard', icon: '📊' },
-  { id: 'identidad', label: 'Cliente', icon: '👤' },
-  { id: 'proyecto', label: 'Backlog', icon: '📋' },
-  { id: 'devops', label: 'Infraestructura', icon: '☁️' },
-  { id: 'finanzas', label: 'Finanzas', icon: '💎' }
+const newTaskTitle    = ref('')
+const newTaskPriority = ref('medium')
+const newTaskDueDate  = ref('')
+const newPaymentAmount = ref(0)
+const newNote = ref('')
+
+watch(lead, (newVal) => {
+  if (newVal && !localLead.value) localLead.value = JSON.parse(JSON.stringify(newVal))
+}, { immediate: true })
+
+const leadTasks = computed(() => tasks.value.filter(t => t.leadId === props.leadId))
+
+const paymentProgress = computed(() => {
+  const paid  = Number(localLead.value?.amountPaid || 0)
+  const total = Number(localLead.value?.value || 0)
+  if (!total) return 0
+  return Math.min(100, Math.round((paid / total) * 100))
+})
+
+const daysSinceCreation = computed(() => {
+  const ts = localLead.value?.createdAt
+  if (!ts) return null
+  const d = ts.toDate ? ts.toDate() : new Date(ts)
+  return Math.floor((Date.now() - d.getTime()) / (1000 * 60 * 60 * 24))
+})
+
+const pendingTasks = computed(() => leadTasks.value.filter(t => t.status !== 'done').length)
+
+const isOverdue = (task) => {
+  if (!task.dueDate || task.status === 'done') return false
+  return new Date(task.dueDate) < new Date()
+}
+
+// ── Stage change ──────────────────────────────────────────────
+const stageOptions = [
+  { id: 'radar',       title: 'Radar' },
+  { id: 'auditoria',   title: 'Auditoría' },
+  { id: 'laboratorio', title: 'Lab' },
+  { id: 'negociacion', title: 'Negoc.' },
+  { id: 'despliegue',  title: 'Deploy' },
 ]
 
-const pipelineSteps = ['radar', 'auditoria', 'laboratorio', 'negociacion', 'despliegue']
+const changeStage = async (newStage) => {
+  if (!localLead.value || localLead.value.clientStatus === newStage) return
+  const oldStage = localLead.value.clientStatus
+  localLead.value.clientStatus = newStage
+  try {
+    await updateLeadData(props.leadId, { clientStatus: newStage })
+    await addNote(`Etapa cambiada: ${oldStage} → ${newStage}`, 'stage_change')
+    if (lead.value) await handlePipelineTransition(lead.value, newStage)
+    toast.success(`Movido a "${newStage}"`)
+  } catch {
+    toast.error('Error al cambiar la etapa.')
+  }
+}
 
-// --- INICIALIZACIÓN Y LECTURA ÚNICA ---
-onMounted(async () => {
-  // 1. Escuchar el Lead
-  const leadRef = doc(db, 'leads', props.leadId)
-  unsub = onSnapshot(leadRef, (snapshot) => {
-    if(snapshot.exists()) {
-       lead.value = { id: snapshot.id, ...snapshot.data() }
-       if(!localLead.value) {
-          localLead.value = JSON.parse(JSON.stringify(lead.value)) // Copia profunda
-       }
-       loading.value = false
+// ── Save / Notes / Tasks / Payments ──────────────────────────
+const saveChanges = async () => {
+  isSaving.value = true
+  await updateLeadData(props.leadId, localLead.value)
+  isSaving.value = false
+  toast.success('Cambios sincronizados correctamente.')
+}
+
+const addManualNote = async () => {
+  if (!newNote.value.trim()) return
+  await addNote(newNote.value.trim(), 'manual')
+  newNote.value = ''
+  toast.success('Nota añadida a la línea de tiempo.')
+}
+
+const addQuickTask = async () => {
+  if (!newTaskTitle.value.trim()) {
+    toast.error('El título de la tarea no puede estar vacío.')
+    return
+  }
+  await addDoc(collection(db, 'tasks'), {
+    leadId:   props.leadId,
+    title:    newTaskTitle.value.trim(),
+    status:   'pending',
+    priority: newTaskPriority.value,
+    dueDate:  newTaskDueDate.value || null,
+    createdAt: serverTimestamp(),
+  })
+  toast.success('Tarea añadida al Backlog.')
+  newTaskTitle.value    = ''
+  newTaskPriority.value = 'medium'
+  newTaskDueDate.value  = ''
+}
+
+const changeTaskStatus = async (taskId, newStatus) => {
+  await updateDoc(doc(db, 'tasks', taskId), { status: newStatus, updatedAt: serverTimestamp() })
+}
+
+const registerPayment = async () => {
+  if (newPaymentAmount.value <= 0) {
+    toast.error('El monto debe ser mayor a 0.')
+    return
+  }
+  isSaving.value = true
+  try {
+    const result = await financeAutomation.processNewPayment(lead.value, newPaymentAmount.value)
+    const amount = newPaymentAmount.value
+    if (result?.success) {
+      localLead.value.amountPaid    = result.newTotal
+      localLead.value.paymentHistory = [
+        ...(localLead.value.paymentHistory || []),
+        { amount, date: new Date() },
+      ]
+      await addNote(`Abono registrado: $${Number(amount).toLocaleString()}`, 'payment')
+      toast.success(`Abono de $${Number(amount).toLocaleString()} registrado y notificado.`)
+      newPaymentAmount.value = 0
     } else {
-       emit('close')
+      localLead.value.amountPaid = Number(localLead.value.amountPaid || 0) + amount
+      await addNote(`Abono registrado: $${Number(amount).toLocaleString()}`, 'payment')
+      await saveChanges()
+      toast.info('Abono registrado localmente (sin notificación).')
+      newPaymentAmount.value = 0
     }
-  })
-
-  // 2. Cargar tareas asociadas (1 sola lectura inicial para ahorrar)
-  const qTasks = query(collection(db, 'tasks'), where('leadId', '==', props.leadId))
-  const snapTasks = await getDocs(qTasks)
-  localTasks.value = snapTasks.docs.map(d => ({ id: d.id, ...d.data() }))
-})
-
-onUnmounted(() => { if (unsub) unsub() })
-
-// --- DETECCIÓN DE CAMBIOS (Para activar el botón Guardar) ---
-watch(localLead, (newVal, oldVal) => { if(oldVal !== null) hasChanges.value = true }, { deep: true }) 
-watch(localTasks, (newVal, oldVal) => { if(oldVal.length > 0) hasChanges.value = true }, { deep: true })
-
-// --- LÓGICA DEL BACKLOG (En Memoria) ---
-const addTaskToDraft = () => {
-  if(!newDraftTask.value.title) return
-  localTasks.value.push({
-    id: `draft_${Date.now()}`, // ID temporal
-    leadId: props.leadId,
-    title: newDraftTask.value.title,
-    priority: newDraftTask.value.priority,
-    status: 'pending',
-    isNew: true // Marca para saber que hay que crearla en Firebase
-  })
-  newDraftTask.value.title = ''
+  } catch (error) {
+    toast.error('Error al registrar el pago.')
+    console.error(error)
+  }
+  isSaving.value = false
 }
 
-const removeTaskDraft = (taskId) => {
-  localTasks.value = localTasks.value.filter(t => t.id !== taskId)
-  hasChanges.value = true
+// ── Helpers ───────────────────────────────────────────────────
+const formatDate = (date) => {
+  if (!date) return '—'
+  const d = date.toDate ? date.toDate() : new Date(date)
+  return d.toLocaleDateString('es-CL', { day: '2-digit', month: 'short', year: 'numeric' })
 }
 
-// --- GRÁFICOS Y MÉTRICAS COMPUTADAS ---
-const paymentProgress = computed(() => {
-  if (!localLead.value?.projectValue) return 0
-  const percent = (Number(localLead.value.amountPaid) / Number(localLead.value.projectValue)) * 100
-  return Math.min(Math.round(percent), 100)
-})
-
-const currentStepIndex = computed(() => pipelineSteps.indexOf(localLead.value?.clientStatus || 'radar'))
-
-// --- SINCRONIZACIÓN BATCH (Ahorro Máximo de Firebase) ---
-const saveAllChanges = async () => {
-    if(!hasChanges.value) return;
-    isSaving.value = true;
-    
-    try {
-        const batch = writeBatch(db)
-
-        // 1. Actualizar Datos del Lead
-        const leadRef = doc(db, 'leads', props.leadId)
-        batch.update(leadRef, { ...localLead.value, updatedAt: new Date() })
-
-        // 2. Procesar Tareas Nuevas
-        const tasksCollection = collection(db, 'tasks')
-        localTasks.value.forEach(task => {
-          if (task.isNew) {
-            const newTaskRef = doc(tasksCollection) // Genera ID automático
-            const { id, isNew, ...taskData } = task // Quitamos las marcas temporales
-            batch.set(newTaskRef, { ...taskData, createdAt: new Date() })
-            task.id = newTaskRef.id // Actualizamos localmente
-            task.isNew = false
-          }
-        })
-
-        // Ejecutamos todo de un solo golpe (1 sola transacción)
-        await batch.commit()
-        hasChanges.value = false;
-
-    } catch(error) {
-        console.error('Error sincronizando:', error);
-    } finally {
-        isSaving.value = false;
-    }
+const taskStatusLabel  = { pending: 'To Do', progress: 'En Curso', done: 'Check' }
+const taskStatusColors = {
+  pending:  'text-gray-400 bg-gray-500/10',
+  progress: 'text-blue-400 bg-blue-500/10',
+  done:     'text-green-400 bg-green-500/10',
+}
+const priorityDot = {
+  high:   'bg-red-500 shadow-[0_0_5px_rgba(239,68,68,0.6)]',
+  medium: 'bg-yellow-500',
+  low:    'bg-gray-600',
+}
+const noteTypeLabel = {
+  manual:       'Nota',
+  stage_change: 'Cambio de Etapa',
+  payment:      'Pago',
+  task:         'Tarea',
+  system:       'Sistema',
+}
+const noteDot = {
+  manual:       'bg-[#D8B4FE]',
+  stage_change: 'bg-blue-400',
+  payment:      'bg-green-400',
+  task:         'bg-yellow-400',
+  system:       'bg-gray-500',
 }
 
-const discardChanges = () => {
-   localLead.value = JSON.parse(JSON.stringify(lead.value));
-   hasChanges.value = false;
-   emit('close')
-}
+const tabs = [
+  { id: 'resumen',   label: 'Dashboard', icon: 'M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z' },
+  { id: 'identidad', label: 'Cliente',   icon: 'M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z' },
+  { id: 'proyecto',  label: 'Backlog',   icon: 'M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01' },
+  { id: 'timeline',  label: 'Actividad', icon: 'M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z' },
+  { id: 'devops',    label: 'Infra',     icon: 'M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2' },
+  { id: 'finanzas',  label: 'Pagos',     icon: 'M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z' },
+]
 </script>
 
 <template>
-  <div class="fixed inset-0 z-[999] flex items-center justify-center bg-black/80 backdrop-blur-sm p-2 sm:p-4 md:p-6" @click.self="emit('close')">
-    
-    <div class="bg-[#050508] w-full max-w-5xl h-[95dvh] md:max-h-[85vh] rounded-2xl md:rounded-3xl border border-white/10 shadow-2xl relative flex flex-col animate-scale-up overflow-hidden">
-        
-        <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center p-6 border-b border-white/5 bg-[#0B0B0E] shrink-0 gap-4">
-          <div>
-            <div class="flex items-center gap-3 mb-1">
-              <span class="w-2 h-2 rounded-full" :class="localLead?.systemStatus === 'active' ? 'bg-green-500 shadow-[0_0_10px_#22c55e]' : 'bg-red-500'"></span>
-              <h2 class="text-xl md:text-2xl font-serif text-white">{{ localLead?.empresa || 'Expediente Cliente' }}</h2>
-            </div>
-            <p class="text-[9px] font-mono text-gray-500 uppercase tracking-widest">ID: {{ leadId }} | {{ localLead?.nombre }}</p>
-          </div>
-          <button @click="emit('close')" class="absolute top-6 right-6 sm:static text-gray-400 hover:text-white bg-white/5 hover:bg-white/10 w-8 h-8 md:w-10 md:h-10 rounded-full flex items-center justify-center transition-all border border-white/5">
-            ✕
-          </button>
+  <div v-if="localLead" class="h-full flex flex-col max-h-[85vh]">
+
+    <!-- Header -->
+    <header class="p-6 md:p-8 border-b border-white/5 flex justify-between items-start bg-white/[0.01] shrink-0">
+      <div>
+        <div class="flex items-center gap-3 flex-wrap">
+          <h2 class="text-xl md:text-2xl font-serif text-white italic">{{ localLead.empresa || localLead.nombre }}</h2>
+          <span class="text-[8px] font-mono px-2 py-0.5 border border-[#D8B4FE]/30 text-[#D8B4FE] rounded-full uppercase">
+            {{ localLead.clientStatus }}
+          </span>
         </div>
+        <p class="text-[9px] font-mono text-gray-500 uppercase tracking-widest mt-1">ID: {{ props.leadId }}</p>
+      </div>
+      <button @click="$emit('close')"
+        class="w-9 h-9 flex items-center justify-center rounded-full bg-white/5 hover:bg-red-500/20 hover:text-red-400 text-gray-400 transition-all shrink-0">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+        </svg>
+      </button>
+    </header>
 
-        <div v-if="!loading" class="flex gap-1 px-4 md:px-6 pt-2 bg-[#0B0B0E] border-b border-white/5 overflow-x-auto custom-scrollbar shrink-0">
-          <button v-for="tab in tabs" :key="tab.id" @click="activeTab = tab.id"
-            class="px-4 py-3 text-[9px] md:text-[10px] font-mono uppercase tracking-widest whitespace-nowrap border-b-2 transition-colors"
-            :class="activeTab === tab.id ? 'border-[#D8B4FE] text-[#D8B4FE]' : 'border-transparent text-gray-500 hover:text-white'">
-            {{ tab.icon }} {{ tab.label }}
-          </button>
-        </div>
+    <!-- Tabs -->
+    <nav class="flex px-6 md:px-8 py-3 gap-1 border-b border-white/5 overflow-x-auto custom-scrollbar shrink-0">
+      <button v-for="tab in tabs" :key="tab.id" @click="activeTab = tab.id"
+        class="flex items-center gap-1.5 px-4 py-2 rounded-xl text-[9px] font-bold uppercase tracking-tighter transition-all whitespace-nowrap"
+        :class="activeTab === tab.id ? 'bg-[#D8B4FE] text-black' : 'bg-white/5 text-gray-400 hover:text-white hover:bg-white/8'">
+        <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" :d="tab.icon"/>
+        </svg>
+        {{ tab.label }}
+        <span v-if="tab.id === 'timeline' && notes.length > 0"
+          class="ml-0.5 text-[7px] bg-white/20 px-1 rounded-full">{{ notes.length }}</span>
+        <span v-if="tab.id === 'proyecto' && pendingTasks > 0"
+          class="ml-0.5 text-[7px] bg-white/20 px-1 rounded-full">{{ pendingTasks }}</span>
+      </button>
+    </nav>
 
-        <div class="flex-grow overflow-y-auto custom-scrollbar p-6 md:p-10 relative">
-          
-          <div v-if="loading" class="flex flex-col items-center justify-center h-40 opacity-50">
-            <span class="text-3xl mb-4 animate-spin">⚙️</span>
-            <p class="text-[10px] font-mono uppercase tracking-[0.2em] text-gray-400">Desencriptando...</p>
-          </div>
+    <!-- Content -->
+    <main class="flex-grow overflow-y-auto p-6 md:p-8 custom-scrollbar bg-[#050508]">
 
-          <div v-else class="space-y-8 pb-10">
-            
-            <div v-show="activeTab === 'resumen'" class="animate-fade space-y-8">
-              
-              <div class="bg-white/[0.02] border border-white/5 p-6 rounded-2xl">
-                <h3 class="text-[10px] text-gray-500 font-mono uppercase tracking-[0.2em] mb-6">Estado en Pipeline</h3>
-                <div class="flex justify-between items-center relative">
-                  <div class="absolute top-1/2 left-0 w-full h-0.5 bg-white/10 -z-10 -translate-y-1/2 rounded"></div>
-                  <div class="absolute top-1/2 left-0 h-0.5 bg-[#D8B4FE] -z-10 -translate-y-1/2 rounded transition-all duration-500" :style="`width: ${(currentStepIndex / 4) * 100}%`"></div>
-                  
-                  <div v-for="(step, i) in pipelineSteps" :key="step" class="flex flex-col items-center gap-2 cursor-pointer group" @click="localLead.clientStatus = step">
-                    <div class="w-4 h-4 rounded-full border-2 transition-colors duration-300" :class="i <= currentStepIndex ? 'bg-[#D8B4FE] border-[#D8B4FE] shadow-[0_0_15px_rgba(216,180,254,0.4)]' : 'bg-[#050508] border-white/20 group-hover:border-white/50'"></div>
-                    <span class="text-[8px] font-mono uppercase tracking-widest hidden md:block" :class="i <= currentStepIndex ? 'text-[#D8B4FE]' : 'text-gray-500'">{{ step }}</span>
-                  </div>
-                </div>
-              </div>
+      <!-- ── DASHBOARD ── -->
+      <div v-if="activeTab === 'resumen'" class="space-y-6 animate-fade-in">
 
-              <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-                <div class="bg-white/[0.02] border border-white/5 p-6 rounded-2xl">
-                  <p class="text-[9px] font-mono text-gray-500 uppercase tracking-widest mb-1">MRR (Mensualidad)</p>
-                  <h3 class="text-2xl font-serif text-white">${{ Number(localLead.monthlyFee || 0).toLocaleString() }} <span class="text-xs text-gray-500">USD</span></h3>
-                </div>
-                <div class="bg-white/[0.02] border border-white/5 p-6 rounded-2xl">
-                  <p class="text-[9px] font-mono text-gray-500 uppercase tracking-widest mb-1">Progreso de Pago</p>
-                  <div class="flex items-center gap-4">
-                    <h3 class="text-2xl font-serif text-white">{{ paymentProgress }}%</h3>
-                    <div class="flex-grow h-1.5 bg-white/10 rounded-full overflow-hidden">
-                      <div class="h-full bg-green-400 transition-all duration-1000" :style="`width: ${paymentProgress}%`"></div>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <div v-show="activeTab === 'identidad'" class="animate-fade">
-              <div class="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-6">
-                <div class="input-group"><label>Empresa</label><input v-model="localLead.empresa" type="text" /></div>
-                <div class="input-group"><label>Nombre Contacto</label><input v-model="localLead.nombre" type="text" /></div>
-                <div class="input-group"><label>Email Corporativo</label><input v-model="localLead.email" type="email" /></div>
-                <div class="input-group"><label>Teléfono</label><input v-model="localLead.telefono" type="text" /></div>
-                <div class="input-group"><label>Región</label><input v-model="localLead.region" type="text" /></div>
-                <div class="input-group"><label>Comuna</label><input v-model="localLead.comuna" type="text" /></div>
-                <div class="input-group md:col-span-2"><label>Sector / Rubro</label><input v-model="localLead.rubro" type="text" /></div>
-                <div class="input-group md:col-span-2"><label>Notas de Auditoría / Detalles</label><textarea v-model="localLead.descripcion" rows="3" class="bg-black/30 border border-white/10 rounded-xl p-4 text-white outline-none focus:border-[#D8B4FE] text-sm custom-scrollbar"></textarea></div>
-              </div>
-            </div>
-
-            <div v-show="activeTab === 'proyecto'" class="animate-fade space-y-6">
-              <div class="flex gap-2">
-                <input v-model="newDraftTask.title" @keyup.enter="addTaskToDraft" type="text" placeholder="Nueva tarea técnica..." class="flex-grow bg-black/50 border border-white/10 rounded-xl px-4 py-3 text-white outline-none focus:border-[#D8B4FE] text-sm font-mono">
-                <select v-model="newDraftTask.priority" class="bg-black/50 border border-white/10 rounded-xl px-4 py-3 text-white outline-none text-[10px] uppercase tracking-widest font-mono cursor-pointer">
-                  <option value="low">Low</option><option value="medium">Med</option><option value="high">High</option>
-                </select>
-                <button @click="addTaskToDraft" class="bg-white/10 hover:bg-[#D8B4FE] hover:text-black text-white px-6 rounded-xl transition-colors text-xl font-bold">+</button>
-              </div>
-
-              <div class="space-y-2">
-                <div v-for="task in localTasks" :key="task.id" class="flex items-center justify-between p-4 bg-white/[0.02] border border-white/5 rounded-xl group hover:border-white/20 transition-colors">
-                  <div class="flex items-center gap-4">
-                    <span class="w-2 h-2 rounded-full" :class="task.priority === 'high' ? 'bg-red-500' : task.priority === 'medium' ? 'bg-yellow-500' : 'bg-blue-500'"></span>
-                    <span class="text-sm font-sans text-white" :class="{'line-through text-gray-500': task.status === 'done'}">{{ task.title }}</span>
-                  </div>
-                  <div class="flex items-center gap-3">
-                    <span v-if="task.isNew" class="text-[8px] uppercase tracking-widest text-[#D8B4FE] border border-[#D8B4FE]/30 px-2 py-1 rounded bg-[#D8B4FE]/10">Borrador</span>
-                    <button v-if="task.isNew" @click="removeTaskDraft(task.id)" class="text-red-500 opacity-0 group-hover:opacity-100 transition-opacity text-xs">✕</button>
-                  </div>
-                </div>
-                <p v-if="localTasks.length === 0" class="text-[10px] text-gray-500 font-mono text-center py-6">No hay tareas en el backlog.</p>
-              </div>
-            </div>
-
-            <div v-show="activeTab === 'devops'" class="animate-fade">
-               <div class="grid grid-cols-1 gap-6">
-                <div class="input-group">
-                  <label>Estado del Servidor</label>
-                  <select v-model="localLead.systemStatus" class="bg-black/30 border border-white/10 rounded-xl p-3 text-white outline-none focus:border-[#D8B4FE] text-sm">
-                    <option value="active">🟢 Operativo y En Línea</option>
-                    <option value="maintenance">🟡 En Mantenimiento</option>
-                    <option value="down">🔴 Caído / Suspendido</option>
-                  </select>
-                </div>
-                <div class="input-group"><label>URL del Proyecto (Producción)</label><input v-model="localLead.prodUrl" type="text" placeholder="https://" /></div>
-                <div class="input-group"><label>Repositorio Git</label><input v-model="localLead.gitRepo" type="text" placeholder="github.com/..." /></div>
-               </div>
-            </div>
-
-            <div v-show="activeTab === 'finanzas'" class="animate-fade">
-              <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
-                <div class="input-group"><label>Valor Total del Proyecto (USD)</label><input v-model="localLead.projectValue" type="number" /></div>
-                <div class="input-group"><label>Monto Pagado a la Fecha (USD)</label><input v-model="localLead.amountPaid" type="number" /></div>
-                <div class="input-group md:col-span-2"><label>Mensualidad (MRR / Retención)</label><input v-model="localLead.monthlyFee" type="number" /></div>
-              </div>
-            </div>
-
-          </div>
-        </div>
-
-        <div v-if="hasChanges" class="bg-[#0B0B0E] border-t border-white/10 p-4 md:p-6 flex justify-between items-center shrink-0 animate-slide-up z-20 shadow-[0_-10px_30px_rgba(0,0,0,0.5)]">
-          <p class="text-[9px] font-mono text-yellow-500 uppercase tracking-widest hidden md:block">⚠️ Modificaciones en Borrador</p>
-          <div class="flex gap-2 w-full md:w-auto">
-            <button @click="discardChanges" class="flex-1 md:flex-none text-[9px] uppercase tracking-widest text-gray-400 hover:text-white transition-colors py-3 px-6 rounded-xl hover:bg-white/5">
-              Cerrar
-            </button>
-            <button @click="saveAllChanges" :disabled="isSaving" class="flex-1 md:flex-none bg-[#D8B4FE] text-black px-6 md:px-10 py-3 rounded-xl text-[10px] font-bold uppercase tracking-widest hover:bg-white transition-all shadow-[0_0_20px_rgba(216,180,254,0.3)] disabled:opacity-50">
-              {{ isSaving ? 'Ejecutando...' : 'Guardar y Sincronizar' }}
+        <!-- Stage change -->
+        <div class="bg-white/[0.02] border border-white/5 p-5 rounded-[2rem]">
+          <p class="text-[8px] font-mono text-gray-600 uppercase tracking-widest mb-3">Etapa del Pipeline</p>
+          <div class="flex gap-2 flex-wrap">
+            <button v-for="stage in stageOptions" :key="stage.id"
+              @click="changeStage(stage.id)"
+              class="px-4 py-2 rounded-xl text-[9px] font-mono uppercase tracking-wider border transition-all"
+              :class="localLead.clientStatus === stage.id
+                ? 'bg-[#D8B4FE]/15 border-[#D8B4FE]/40 text-[#D8B4FE]'
+                : 'bg-white/5 border-white/10 text-gray-500 hover:text-white hover:border-white/20'">
+              {{ stage.title }}
             </button>
           </div>
         </div>
 
-    </div>
+        <!-- KPIs -->
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+          <div class="bg-white/[0.02] border border-white/5 p-6 rounded-[2rem] flex flex-col">
+            <p class="text-[8px] font-mono text-gray-500 uppercase mb-2">Recaudado</p>
+            <p class="text-2xl font-serif text-white">${{ (localLead.amountPaid || 0).toLocaleString() }}</p>
+          </div>
+          <div class="bg-white/[0.02] border border-white/5 p-6 rounded-[2rem] flex flex-col">
+            <p class="text-[8px] font-mono text-gray-500 uppercase mb-2">Contrato</p>
+            <p class="text-2xl font-serif text-[#D8B4FE]">${{ (localLead.value || 0).toLocaleString() }}</p>
+          </div>
+          <div class="bg-white/[0.02] border border-white/5 p-6 rounded-[2rem] flex flex-col">
+            <p class="text-[8px] font-mono text-gray-500 uppercase mb-2">Tareas Pendientes</p>
+            <p class="text-2xl font-serif text-white">{{ pendingTasks }}</p>
+          </div>
+          <div class="bg-white/[0.02] border border-white/5 p-6 rounded-[2rem] flex flex-col">
+            <p class="text-[8px] font-mono text-gray-500 uppercase mb-2">Días en Sistema</p>
+            <p class="text-2xl font-serif text-white">{{ daysSinceCreation ?? '—' }}</p>
+          </div>
+        </div>
+
+        <!-- Progress bar de cobranza -->
+        <div class="bg-white/[0.02] border border-white/5 p-6 rounded-[2rem]">
+          <div class="flex justify-between items-center mb-3">
+            <p class="text-[9px] font-mono text-gray-500 uppercase tracking-widest">Progreso de Cobranza</p>
+            <p class="text-sm font-serif text-white">{{ paymentProgress }}%</p>
+          </div>
+          <div class="h-2 bg-white/5 rounded-full overflow-hidden">
+            <div
+              class="h-full rounded-full transition-all duration-700"
+              :class="paymentProgress >= 100 ? 'bg-green-500' : paymentProgress >= 50 ? 'bg-[#D8B4FE]' : 'bg-orange-500'"
+              :style="{ width: `${paymentProgress}%` }"
+            ></div>
+          </div>
+          <div class="flex justify-between mt-2">
+            <span class="text-[8px] font-mono text-gray-600">${{ (localLead.amountPaid || 0).toLocaleString() }} pagado</span>
+            <span class="text-[8px] font-mono text-gray-600">${{ (localLead.value || 0).toLocaleString() }} total</span>
+          </div>
+        </div>
+
+        <!-- Mensualidad -->
+        <div v-if="localLead.monthlyFee" class="bg-white/[0.02] border border-[#D8B4FE]/10 p-6 rounded-[2rem] flex items-center justify-between">
+          <p class="text-[9px] font-mono text-gray-500 uppercase tracking-widest">Mensualidad MRR</p>
+          <p class="text-lg font-serif text-[#D8B4FE]">${{ Number(localLead.monthlyFee).toLocaleString() }} / mes</p>
+        </div>
+      </div>
+
+      <!-- ── CLIENTE ── -->
+      <div v-if="activeTab === 'identidad'" class="space-y-6 animate-fade-in">
+        <div class="grid md:grid-cols-2 gap-6">
+          <div class="space-y-4">
+            <div class="input-group"><label>Nombre del Contacto</label><input v-model="localLead.nombre" type="text" /></div>
+            <div class="input-group"><label>Correo Electrónico</label><input v-model="localLead.email" type="email" /></div>
+            <div class="input-group"><label>Teléfono Corporativo</label><input v-model="localLead.telefono" type="text" /></div>
+          </div>
+          <div class="space-y-4">
+            <div class="input-group"><label>Firma / Empresa</label><input v-model="localLead.empresa" type="text" /></div>
+            <div class="input-group"><label>RUT / Tax ID</label><input v-model="localLead.rut" type="text" /></div>
+            <div class="input-group"><label>Región / País</label><input v-model="localLead.region" type="text" /></div>
+          </div>
+        </div>
+
+        <!-- Desafío y contexto del lead -->
+        <div class="input-group">
+          <label>Desafío / Problema Declarado</label>
+          <textarea v-model="localLead.desafio" rows="3"
+            class="bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-xs text-white outline-none focus:border-[#D8B4FE]/50 transition-all resize-none"></textarea>
+        </div>
+
+        <div class="grid md:grid-cols-2 gap-6">
+          <div class="input-group">
+            <label>Web(s) Actual(es)</label>
+            <input v-model="localLead.redesWeb" type="text" placeholder="www.ejemplo.cl, app.ejemplo.cl" />
+          </div>
+          <div class="input-group">
+            <label>Fuente del Lead</label>
+            <input :value="localLead.source || '—'" type="text" readonly
+              class="bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-xs text-gray-500 outline-none cursor-default" />
+          </div>
+        </div>
+      </div>
+
+      <!-- ── BACKLOG ── -->
+      <div v-if="activeTab === 'proyecto'" class="space-y-6 animate-fade-in">
+        <!-- Formulario nueva tarea -->
+        <div class="bg-white/5 p-6 rounded-3xl border border-white/10">
+          <h3 class="text-xs font-mono text-white mb-4 uppercase tracking-widest">Inyectar Tarea</h3>
+          <div class="flex gap-2 mb-3">
+            <input v-model="newTaskTitle" type="text" placeholder="Descripción de la tarea..."
+              class="flex-grow bg-black/40 border border-white/10 rounded-xl px-4 py-3 text-xs text-white outline-none focus:border-[#D8B4FE]/50 transition-all"
+              @keydown.enter="addQuickTask" />
+            <button @click="addQuickTask" class="bg-[#D8B4FE] text-black px-5 rounded-xl font-bold text-[10px] uppercase hover:bg-white transition-colors">
+              Añadir
+            </button>
+          </div>
+          <div class="flex gap-2 flex-wrap items-center">
+            <button v-for="p in ['low', 'medium', 'high']" :key="p"
+              @click="newTaskPriority = p"
+              class="px-3 py-1.5 rounded-lg text-[8px] font-mono uppercase tracking-widest border transition-all"
+              :class="newTaskPriority === p
+                ? p === 'high'   ? 'bg-red-500/20 border-red-500/40 text-red-300'
+                : p === 'medium' ? 'bg-yellow-500/20 border-yellow-500/40 text-yellow-300'
+                                 : 'bg-gray-500/20 border-gray-500/40 text-gray-300'
+                : 'bg-white/5 border-white/10 text-gray-600 hover:text-white'">
+              {{ p }}
+            </button>
+            <input v-model="newTaskDueDate" type="date"
+              class="ml-auto bg-black/40 border border-white/10 rounded-lg px-3 py-1.5 text-[9px] font-mono text-gray-400 outline-none focus:border-[#D8B4FE]/50 transition-all"
+              title="Fecha límite (opcional)" />
+          </div>
+        </div>
+
+        <!-- Lista de tareas -->
+        <div v-if="leadTasks.length === 0" class="text-center py-8">
+          <p class="text-[10px] font-mono text-gray-700 uppercase tracking-widest">Sin tareas para este cliente</p>
+        </div>
+        <div v-else class="space-y-3">
+          <div v-for="task in leadTasks" :key="task.id"
+            class="bg-[#0B0B0E] border p-4 rounded-2xl flex items-start gap-4 group transition-all"
+            :class="isOverdue(task) ? 'border-red-500/30 bg-red-950/10' : 'border-white/5'">
+            <div class="w-2 h-2 rounded-full shrink-0 mt-1.5" :class="priorityDot[task.priority] || priorityDot.medium"></div>
+            <div class="flex-1 min-w-0">
+              <p class="text-sm text-white leading-snug mb-1">{{ task.title }}</p>
+              <div class="flex items-center gap-2 flex-wrap mb-2">
+                <span class="text-[8px] font-mono px-2 py-0.5 rounded-md" :class="taskStatusColors[task.status] || taskStatusColors.pending">
+                  {{ taskStatusLabel[task.status] || task.status }}
+                </span>
+                <span v-if="task.dueDate"
+                  class="text-[8px] font-mono px-2 py-0.5 rounded-md"
+                  :class="isOverdue(task) ? 'text-red-400 bg-red-500/10' : 'text-gray-500 bg-white/5'">
+                  {{ isOverdue(task) ? '⚠ ' : '' }}{{ new Date(task.dueDate).toLocaleDateString('es-CL', { day: '2-digit', month: 'short' }) }}
+                </span>
+              </div>
+              <div class="flex gap-2 flex-wrap">
+                <button v-for="status in ['pending', 'progress', 'done'].filter(s => s !== task.status)" :key="status"
+                  @click="changeTaskStatus(task.id, status)"
+                  class="text-[8px] font-mono text-gray-600 hover:text-[#D8B4FE] uppercase tracking-widest transition-colors">
+                  → {{ taskStatusLabel[status] }}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── ACTIVIDAD / TIMELINE ── -->
+      <div v-if="activeTab === 'timeline'" class="space-y-6 animate-fade-in">
+
+        <!-- Add note -->
+        <div class="bg-white/5 p-6 rounded-3xl border border-white/10">
+          <h3 class="text-xs font-mono text-white mb-4 uppercase tracking-widest">Añadir Nota</h3>
+          <div class="flex gap-2">
+            <textarea v-model="newNote"
+              placeholder="Decisión tomada, reunión resumida, comentario interno..."
+              rows="2"
+              class="flex-grow bg-black/40 border border-white/10 rounded-xl px-4 py-3 text-xs text-white outline-none focus:border-[#D8B4FE]/50 transition-all resize-none"
+              @keydown.ctrl.enter="addManualNote"></textarea>
+            <button @click="addManualNote"
+              class="bg-[#D8B4FE] text-black px-4 rounded-xl font-bold text-[10px] uppercase hover:bg-white transition-colors self-end py-3">
+              Añadir
+            </button>
+          </div>
+          <p class="text-[8px] font-mono text-gray-700 mt-2">Ctrl + Enter para añadir</p>
+        </div>
+
+        <!-- Timeline -->
+        <div v-if="notes.length === 0" class="text-center py-10">
+          <div class="w-10 h-10 rounded-full bg-white/5 flex items-center justify-center mx-auto mb-3">
+            <svg class="w-5 h-5 text-gray-700" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/>
+            </svg>
+          </div>
+          <p class="text-[10px] font-mono text-gray-700 uppercase tracking-widest">Sin actividad registrada</p>
+        </div>
+        <div v-else class="relative">
+          <div class="absolute left-[5px] top-0 bottom-0 w-px bg-white/5"></div>
+          <div class="space-y-0">
+            <div v-for="note in notes" :key="note.id" class="flex gap-4 pb-6">
+              <div class="w-3 h-3 rounded-full shrink-0 mt-0.5 border-2 border-[#050508] z-10"
+                :class="noteDot[note.type] || 'bg-gray-500'"></div>
+              <div class="flex-1 min-w-0">
+                <div class="flex items-center gap-2 flex-wrap mb-1">
+                  <span class="text-[8px] font-mono text-gray-600 uppercase tracking-widest">
+                    {{ formatDate(note.createdAt) }}
+                  </span>
+                  <span class="text-[7px] font-mono px-1.5 py-0.5 rounded bg-white/5 text-gray-500 uppercase">
+                    {{ noteTypeLabel[note.type] || note.type }}
+                  </span>
+                </div>
+                <p class="text-sm text-gray-300 leading-relaxed">{{ note.text }}</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── INFRA ── -->
+      <div v-if="activeTab === 'devops'" class="space-y-6 animate-fade-in">
+        <div class="grid md:grid-cols-2 gap-4">
+          <div class="input-group"><label>Proveedor de Hosting</label><input v-model="localLead.hosting" placeholder="AWS, Vercel, VPS..." /></div>
+          <div class="input-group"><label>Dominio Principal</label><input v-model="localLead.domain" placeholder="www.ejemplo.com" /></div>
+          <div class="input-group md:col-span-2"><label>Repositorio GitHub/GitLab</label><input v-model="localLead.repo" /></div>
+        </div>
+      </div>
+
+      <!-- ── FINANZAS ── -->
+      <div v-if="activeTab === 'finanzas'" class="space-y-6 animate-fade-in">
+
+        <!-- Mensualidad MRR -->
+        <div class="bg-[#D8B4FE]/5 border border-[#D8B4FE]/15 p-6 rounded-[2rem]">
+          <p class="text-[9px] font-mono text-[#D8B4FE]/70 uppercase tracking-widest mb-3">Mensualidad / MRR</p>
+          <div class="flex items-center gap-2">
+            <span class="text-gray-500 font-mono">$</span>
+            <input v-model="localLead.monthlyFee" type="number" placeholder="0"
+              class="flex-1 bg-transparent border-b border-white/20 py-2 text-xl text-white outline-none focus:border-[#D8B4FE] transition-colors font-mono" />
+            <span class="text-[9px] text-gray-600 font-mono">/ mes</span>
+          </div>
+          <p class="text-[8px] text-gray-600 font-mono mt-2 uppercase">Afecta el cálculo de MRR en el Dashboard</p>
+        </div>
+
+        <!-- Registrar abono -->
+        <div class="bg-green-950/30 border border-green-500/20 p-6 rounded-[2rem]">
+          <h3 class="text-green-400/70 font-mono text-[9px] uppercase tracking-widest mb-4">Registrar Abono</h3>
+          <div class="flex flex-col md:flex-row items-end gap-4">
+            <div class="flex-grow w-full">
+              <label class="text-[8px] text-gray-500 uppercase block mb-2 font-mono">Monto Recibido ($)</label>
+              <input v-model="newPaymentAmount" type="number"
+                class="w-full bg-white/5 border-b border-white/20 py-3 text-2xl text-white outline-none focus:border-green-400 transition-colors font-serif" />
+            </div>
+            <button @click="registerPayment" :disabled="isSaving"
+              class="bg-green-500 text-black px-8 py-3.5 rounded-2xl font-bold uppercase text-[10px] hover:bg-white transition-all disabled:opacity-50 shrink-0">
+              {{ isSaving ? 'Procesando...' : 'Registrar Abono' }}
+            </button>
+          </div>
+        </div>
+
+        <!-- Historial de pagos -->
+        <div>
+          <h3 class="text-[9px] font-mono text-gray-500 uppercase tracking-widest mb-4">Historial de Pagos</h3>
+          <div v-if="!localLead.paymentHistory || localLead.paymentHistory.length === 0"
+            class="bg-white/[0.02] border border-dashed border-white/5 rounded-2xl py-8 text-center">
+            <p class="text-[9px] font-mono text-gray-700 uppercase tracking-widest">Sin pagos registrados</p>
+          </div>
+          <div v-else class="space-y-2">
+            <div v-for="(payment, idx) in [...localLead.paymentHistory].reverse()" :key="idx"
+              class="flex items-center justify-between bg-white/[0.02] border border-white/5 px-5 py-4 rounded-2xl">
+              <div class="flex items-center gap-3">
+                <div class="w-2 h-2 rounded-full bg-green-500"></div>
+                <span class="text-[9px] font-mono text-gray-400 uppercase">{{ formatDate(payment.date) }}</span>
+              </div>
+              <span class="text-sm font-serif text-white">+${{ Number(payment.amount).toLocaleString() }}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </main>
+
+    <!-- Footer -->
+    <footer class="p-6 md:p-8 border-t border-white/5 bg-white/[0.01] flex justify-end gap-3 shrink-0">
+      <button @click="$emit('close')"
+        class="px-6 py-3 rounded-2xl bg-white/5 border border-white/10 text-[10px] font-mono uppercase tracking-widest text-gray-400 hover:text-white transition-all">
+        Cerrar
+      </button>
+      <button @click="saveChanges" :disabled="isSaving"
+        class="bg-[#D8B4FE] text-black px-8 py-3 rounded-2xl text-[10px] font-bold uppercase tracking-[0.2em] shadow-xl hover:scale-105 transition-all disabled:opacity-50">
+        {{ isSaving ? 'Guardando...' : 'Sincronizar Cambios' }}
+      </button>
+    </footer>
   </div>
 </template>
 
 <style scoped>
 @reference "tailwindcss";
-
-.animate-scale-up { animation: scaleUp 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
-@keyframes scaleUp { from { opacity: 0; transform: scale(0.95) translateY(20px); } to { opacity: 1; transform: scale(1) translateY(0); } }
-
-.animate-fade { animation: fadeIn 0.4s ease forwards; }
-.animate-slide-up { animation: slideUp 0.3s ease forwards; }
-@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-@keyframes slideUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
-
-/* Inputs Unificados con contacto.vue */
 .input-group { @apply flex flex-col gap-2; }
-.input-group label { @apply text-[9px] uppercase tracking-[0.2em] text-gray-500 font-mono; }
-.input-group input { 
-  @apply w-full bg-black/30 border border-white/10 rounded-xl px-4 py-3 text-white outline-none focus:border-[#D8B4FE] focus:bg-black/60 transition-all font-sans text-sm shadow-inner; 
-}
-
-.custom-scrollbar::-webkit-scrollbar { width: 4px; height: 4px; }
-.custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(216,180,254,0.2); border-radius: 10px; }
+.input-group label { @apply text-[9px] text-gray-500 font-mono uppercase tracking-widest; }
+.input-group input { @apply bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-xs text-white outline-none focus:border-[#D8B4FE]/50 transition-all; }
+.custom-scrollbar::-webkit-scrollbar { height: 4px; width: 4px; }
+.custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(216, 180, 254, 0.2); border-radius: 10px; }
+.animate-fade-in { animation: fadeIn 0.35s ease-out; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
 </style>
